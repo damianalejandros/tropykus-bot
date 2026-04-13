@@ -22,6 +22,8 @@ const CONFIG = {
   minProfitThreshold: parseFloat(process.env.MIN_PROFIT || "50"),
   pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "30000"), // 30 seg
   graphqlUrl: process.env.GRAPHQL_URL || "https://graphql1.tropykus.com/",
+  telegramToken:  process.env.TELEGRAM_TOKEN,
+  telegramChatId: process.env.TELEGRAM_CHAT_ID,
 };
 
 // ─── Contratos ────────────────────────────────────────────────────────────────
