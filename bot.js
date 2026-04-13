@@ -1,12 +1,8 @@
 /**
  * Tropykus Liquidation Bot — Rootstock (RSK) Mainnet
- * Mercados: kDOC y kUSDRIF
- *
- * Prerequisitos:
- *   npm install ethers node-fetch dotenv
- *
- * Configuración:
- *   Crear archivo .env con PRIVATE_KEY y RPC_URL (ver abajo)
+ * Mercados deuda: kDOC, kUSDRIF
+ * Colateral preferido: kRBTC → kBPRO (el que tenga mayor balance en el borrower)
+ * Alertas: Telegram
  */
 
 require("dotenv").config();
@@ -14,56 +10,47 @@ const { ethers } = require("ethers");
 const fetch = (...args) =>
   import("node-fetch").then(({ default: f }) => f(...args));
 
-// ─── Configuración ────────────────────────────────────────────────────────────
-
 const CONFIG = {
-  rpcUrl: process.env.RPC_URL || "https://public-node.rsk.co",
-  privateKey: process.env.PRIVATE_KEY, // NUNCA hardcodear — usar .env
-  minProfitThreshold: parseFloat(process.env.MIN_PROFIT || "50"),
-  pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "30000"), // 30 seg
-  graphqlUrl: process.env.GRAPHQL_URL || "https://graphql1.tropykus.com/",
+  rpcUrl:         process.env.RPC_URL || "https://public-node.rsk.co",
+  privateKey:     process.env.PRIVATE_KEY,
+  minProfitUSD:   parseFloat(process.env.MIN_PROFIT || "50"),
+  pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "30000"),
+  graphqlUrl:     process.env.GRAPHQL_URL || "https://graphql1.tropykus.com/",
   telegramToken:  process.env.TELEGRAM_TOKEN,
   telegramChatId: process.env.TELEGRAM_CHAT_ID,
 };
 
-// ─── Contratos ────────────────────────────────────────────────────────────────
-
 const MARKETS = {
   kDOC: {
-    address: "0x544eb90e766b405134b3b3f62b6b4c23fcd5fda2",
-    underlying: "0xe700691da7b9851f2f35f8b8182c69c53ccad9db", // DOC
-    name: "kDOC",
-    decimals: 18,
+    address:    "0x544eb90e766b405134b3b3f62b6b4c23fcd5fda2",
+    underlying: "0xe700691da7b9851f2f35f8b8182c69c53ccad9db",
+    name:       "kDOC",
+    decimals:   18,
   },
   kUSDRIF: {
-    address: "0xDdf3CE45fcf080DF61ee61dac5Ddefef7ED4F46C",
-    underlying: "0x3a15461d8ae0f0fb5fa2629e9da7d66a794a6e37", // USDRIF
-    name: "kUSDRIF",
-    decimals: 18,
+    address:    "0xDdf3CE45fcf080DF61ee61dac5Ddefef7ED4F46C",
+    underlying: "0x3a15461d8ae0f0fb5fa2629e9da7d66a794a6e37",
+    name:       "kUSDRIF",
+    decimals:   18,
   },
   kRBTC: {
-    address: "0x0aeadb9d4c6a80462a47e87e76e487fa8b9a37d7",
-    name: "kRBTC",
+    address:  "0x0aeadb9d4c6a80462a47e87e76e487fa8b9a37d7",
+    name:     "kRBTC",
     decimals: 18,
   },
   kBPRO: {
-    address: "0x405062731d8656af5950ef952be9fa110878036b",
-    name: "kBPRO",
-    decimals: 18,
+    address:    "0x405062731d8656af5950ef952be9fa110878036b",
+    underlying: "0x440cd83c160de5c96ddb20246815ea44c7abbca8",
+    name:       "kBPRO",
+    decimals:   18,
   },
 };
 
-// ABI mínimo de Compound/Tropykus para liquidación
+const COLLATERAL_OPTIONS = [MARKETS.kRBTC, MARKETS.kBPRO];
+
 const KTOKEN_ABI = [
-  // Liquidar deuda en mercados ERC-20
   "function liquidateBorrow(address borrower, uint repayAmount, address cTokenCollateral) external returns (uint)",
-  // Para mercados RBTC (ether)
-  "function liquidateBorrow(address borrower, address cTokenCollateral) external payable returns (uint)",
-  // Consultar factor de cierre máximo
-  "function closeFactorMantissa() view returns (uint)",
-  // Obtener snapshot del borrower
   "function getAccountSnapshot(address account) view returns (uint, uint, uint, uint)",
-  // Balance de tokens subyacentes
   "function borrowBalanceCurrent(address account) external returns (uint)",
 ];
 
@@ -71,10 +58,7 @@ const ERC20_ABI = [
   "function approve(address spender, uint256 amount) external returns (bool)",
   "function allowance(address owner, address spender) view returns (uint256)",
   "function balanceOf(address account) view returns (uint256)",
-  "function decimals() view returns (uint8)",
 ];
-
-// ─── GraphQL ──────────────────────────────────────────────────────────────────
 
 const GRAPHQL_QUERY = `
   query FindManyUser_balances($where: User_balancesWhereInput) {
@@ -99,7 +83,7 @@ const GRAPHQL_VARIABLES = {
   where: {
     users: {
       is: {
-        is_attacker: { equals: false },
+        is_attacker:       { equals: false },
         is_in_liquidation: { equals: true },
       },
     },
@@ -111,146 +95,200 @@ const GRAPHQL_VARIABLES = {
   },
 };
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
 function log(level, msg, data = null) {
-  const ts = new Date().toISOString();
-  const prefix = { INFO: "ℹ️ ", WARN: "⚠️ ", ERROR: "❌", OK: "✅", EXEC: "🔥" }[level] || "  ";
-  console.log(`[${ts}] ${prefix} ${msg}`);
+  const ts   = new Date().toISOString();
+  const icon = { INFO: "ℹ️ ", WARN: "⚠️ ", ERROR: "❌", OK: "✅", EXEC: "🔥" }[level] || "  ";
+  console.log(`[${ts}] ${icon} ${msg}`);
   if (data) console.log(JSON.stringify(data, null, 2));
 }
 
+async function sendTelegram(msg) {
+  if (!CONFIG.telegramToken || !CONFIG.telegramChatId) return;
+  try {
+    const f = await import("node-fetch");
+    const fetchFn = f.default;
+    await fetchFn(`https://api.telegram.org/bot${CONFIG.telegramToken}/sendMessage`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body:    JSON.stringify({
+        chat_id:    CONFIG.telegramChatId,
+        text:       msg,
+        parse_mode: "HTML",
+      }),
+    });
+  } catch (err) {
+    log("WARN", `No se pudo enviar alerta a Telegram: ${err.message}`);
+  }
+}
+
 function getMarketByName(name) {
-  // El nombre en GraphQL puede venir como "DOC", "kDOC", "USDRIF", "kUSDRIF", etc.
-  const normalized = name.toLowerCase().replace("k", "");
+  const n = name.toLowerCase();
   return Object.values(MARKETS).find(
     (m) =>
-      m.name.toLowerCase() === name.toLowerCase() ||
-      m.name.toLowerCase().replace("k", "") === normalized
+      m.name.toLowerCase() === n ||
+      m.name.toLowerCase().replace("k", "") === n.replace("k", "")
   );
 }
 
-// ─── Lógica principal ─────────────────────────────────────────────────────────
-
-async function fetchLiquidationOpportunities() {
-  const res = await fetch(CONFIG.graphqlUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      query: GRAPHQL_QUERY,
-      variables: GRAPHQL_VARIABLES,
-    }),
-  });
-
-  const json = await res.json();
-  if (json.errors) {
-    throw new Error(`GraphQL error: ${json.errors[0].message}`);
-  }
-
-  return json.data.findManyUser_balances || [];
-}
-
-async function approveSpendinIfNeeded(tokenContract, spenderAddress, amount, signer) {
-  const owner = await signer.getAddress();
-  const allowance = await tokenContract.allowance(owner, spenderAddress);
+async function approveIfNeeded(underlyingAddress, spender, amount, signer) {
+  const token     = new ethers.Contract(underlyingAddress, ERC20_ABI, signer);
+  const owner     = await signer.getAddress();
+  const allowance = await token.allowance(owner, spender);
   if (allowance < amount) {
-    log("INFO", `Aprobando gasto en token ${tokenContract.target}...`);
-    const tx = await tokenContract.approve(spenderAddress, ethers.MaxUint256);
+    log("INFO", `Aprobando gasto de token ${underlyingAddress}...`);
+    const tx = await token.approve(spender, ethers.MaxUint256);
     await tx.wait();
     log("OK", "Aprobación confirmada.");
   }
 }
 
-async function executeLiquidation(opportunity, provider, signer) {
-  const { users, markets, borrows } = opportunity;
-  const borrowerAddress = users.address_lowercase;
-  const marketName = markets.name;
-  const profit = parseFloat(users.liquidation_profit);
+async function chooseBestCollateral(borrowerAddress, provider) {
+  let best        = MARKETS.kRBTC;
+  let bestBalance = 0n;
 
-  log("EXEC", `Ejecutando liquidación`, {
-    borrower: borrowerAddress,
-    market: marketName,
-    profit,
-    borrows,
-  });
-
-  // Identificar el mercado deudor
-  const debtMarket = getMarketByName(marketName);
-  if (!debtMarket) {
-    log("WARN", `Mercado desconocido: ${marketName} — saltando.`);
-    return null;
+  for (const market of COLLATERAL_OPTIONS) {
+    try {
+      const kToken = new ethers.Contract(market.address, KTOKEN_ABI, provider);
+      const [, kBalance] = await kToken.getAccountSnapshot(borrowerAddress);
+      log("INFO", `  Colateral ${market.name} del borrower: ${kBalance.toString()} kTokens`);
+      if (kBalance > bestBalance) {
+        bestBalance = kBalance;
+        best        = market;
+      }
+    } catch (err) {
+      log("WARN", `  No se pudo consultar ${market.name}: ${err.message}`);
+    }
   }
 
-  // El colateral a cobrar: preferir kRBTC, luego cualquier otro disponible
-  // En una implementación más robusta, esto se consultaría on-chain
-  const collateralMarket = MARKETS.kRBTC;
+  if (bestBalance === 0n) {
+    log("WARN", "  Borrower sin colateral en kRBTC ni kBPRO — usando kRBTC como fallback.");
+  } else {
+    log("INFO", `  Colateral elegido: ${best.name}`);
+  }
 
-  const kTokenContract = new ethers.Contract(debtMarket.address, KTOKEN_ABI, signer);
+  return best;
+}
 
-  // Calcular repayAmount: se liquida hasta el 50% de la deuda (close factor típico)
-  // borrows viene en la unidad del token subyacente
-  const borrowAmount = ethers.parseUnits(
-    parseFloat(borrows).toFixed(debtMarket.decimals),
-    debtMarket.decimals
+async function executeLiquidation(opportunity, provider, signer) {
+  const { users, markets, borrows } = opportunity;
+  const borrower   = users.address_lowercase;
+  const profitUSD  = parseFloat(users.liquidation_profit);
+  const marketName = markets.name;
+
+  log("EXEC", `Iniciando liquidación`, { borrower, market: marketName, profitUSD });
+  await sendTelegram(
+    `🔥 <b>Liquidación detectada</b>\n` +
+    `Borrower: <code>${borrower}</code>\n` +
+    `Mercado: ${marketName}\n` +
+    `Profit estimado: <b>$${profitUSD.toFixed(2)} USD</b>`
   );
-  const repayAmount = borrowAmount / 2n; // 50% close factor
+
+  const debtMarket = getMarketByName(marketName);
+  if (!debtMarket) {
+    log("WARN", `Mercado desconocido: "${marketName}" — saltando.`);
+    return;
+  }
+
+  const collateralMarket = await chooseBestCollateral(borrower, provider);
+  const kTokenContract   = new ethers.Contract(debtMarket.address, KTOKEN_ABI, signer);
+
+  let repayAmount;
+  try {
+    const borrowBalance = await kTokenContract.borrowBalanceCurrent(borrower);
+    repayAmount = borrowBalance / 2n;
+    log("INFO", `Deuda on-chain: ${ethers.formatUnits(borrowBalance, debtMarket.decimals)} | Repago (50%): ${ethers.formatUnits(repayAmount, debtMarket.decimals)}`);
+  } catch (err) {
+    log("WARN", `borrowBalanceCurrent falló, usando valor de GraphQL. Error: ${err.message}`);
+    repayAmount = ethers.parseUnits(
+      (parseFloat(borrows) / 2).toFixed(debtMarket.decimals),
+      debtMarket.decimals
+    );
+  }
+
+  if (repayAmount === 0n) {
+    log("WARN", "repayAmount = 0 — saltando.");
+    return;
+  }
 
   try {
-    // Si el mercado tiene token subyacente ERC-20 (DOC, USDRIF), aprobar gasto
     if (debtMarket.underlying) {
-      const underlyingContract = new ethers.Contract(
-        debtMarket.underlying,
-        ERC20_ABI,
-        signer
-      );
+      const token     = new ethers.Contract(debtMarket.underlying, ERC20_ABI, signer);
+      const myBalance = await token.balanceOf(await signer.getAddress());
 
-      // Verificar balance propio
-      const myBalance = await underlyingContract.balanceOf(await signer.getAddress());
       if (myBalance < repayAmount) {
-        log("WARN", `Balance insuficiente de ${debtMarket.name}. Tenés: ${ethers.formatUnits(myBalance, debtMarket.decimals)}, necesitás: ${ethers.formatUnits(repayAmount, debtMarket.decimals)}`);
-        return null;
+        const msg = `Balance insuficiente de ${debtMarket.name}. Tenés: ${ethers.formatUnits(myBalance, debtMarket.decimals)}, necesitás: ${ethers.formatUnits(repayAmount, debtMarket.decimals)}`;
+        log("WARN", msg);
+        await sendTelegram(`⚠️ <b>Balance insuficiente</b>\n${msg}`);
+        return;
       }
 
-      await approveSpendinIfNeeded(
-        underlyingContract,
-        debtMarket.address,
-        repayAmount,
-        signer
-      );
-
-      const gasEstimate = await kTokenContract.liquidateBorrow.estimateGas(
-        borrowerAddress,
-        repayAmount,
-        collateralMarket.address
-      );
-
-      log("INFO", `Gas estimado: ${gasEstimate.toString()}`);
-
-      const tx = await kTokenContract.liquidateBorrow(
-        borrowerAddress,
-        repayAmount,
-        collateralMarket.address,
-        { gasLimit: (gasEstimate * 120n) / 100n } // +20% buffer
-      );
-
-      log("INFO", `Transacción enviada: ${tx.hash}`);
-      const receipt = await tx.wait();
-      log("OK", `Liquidación confirmada en bloque ${receipt.blockNumber}`, {
-        txHash: tx.hash,
-        gasUsed: receipt.gasUsed.toString(),
-        borrower: borrowerAddress,
-        profit,
-      });
-
-      return receipt;
+      await approveIfNeeded(debtMarket.underlying, debtMarket.address, repayAmount, signer);
     }
+
+    let gasLimit;
+    try {
+      const estimated = await kTokenContract.liquidateBorrow.estimateGas(
+        borrower, repayAmount, collateralMarket.address
+      );
+      gasLimit = (estimated * 130n) / 100n;
+      log("INFO", `Gas estimado: ${estimated} → con buffer: ${gasLimit}`);
+    } catch (err) {
+      gasLimit = 600000n;
+      log("WARN", `estimateGas falló — usando límite fijo ${gasLimit}. Error: ${err.message}`);
+    }
+
+    const tx = await kTokenContract.liquidateBorrow(
+      borrower,
+      repayAmount,
+      collateralMarket.address,
+      { gasLimit }
+    );
+
+    log("INFO", `Tx enviada: ${tx.hash}`);
+    const receipt = await tx.wait();
+
+    log("OK", `Liquidación exitosa`, {
+      txHash:    tx.hash,
+      block:     receipt.blockNumber,
+      gasUsed:   receipt.gasUsed.toString(),
+      borrower,
+      deudaEn:   debtMarket.name,
+      colateral: collateralMarket.name,
+      profitUSD: `$${profitUSD}`,
+    });
+
+    await sendTelegram(
+      `✅ <b>Liquidación exitosa 🎉</b>\n` +
+      `Borrower: <code>${borrower}</code>\n` +
+      `Deuda en: ${debtMarket.name}\n` +
+      `Colateral cobrado: ${collateralMarket.name}\n` +
+      `Profit: <b>$${profitUSD.toFixed(2)} USD</b>\n` +
+      `Bloque: ${receipt.blockNumber}\n` +
+      `Tx: <code>${tx.hash}</code>`
+    );
+
   } catch (err) {
-    log("ERROR", `Fallo en liquidación de ${borrowerAddress}: ${err.message}`);
-    return null;
+    log("ERROR", `Liquidación fallida para ${borrower}: ${err.message}`);
+    await sendTelegram(
+      `❌ <b>Liquidación fallida</b>\n` +
+      `Borrower: <code>${borrower}</code>\n` +
+      `Error: ${err.message}`
+    );
   }
 }
 
-// ─── Loop principal ───────────────────────────────────────────────────────────
+async function fetchOpportunities() {
+  const f = await import("node-fetch");
+  const fetchFn = f.default;
+  const res = await fetchFn(CONFIG.graphqlUrl, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ query: GRAPHQL_QUERY, variables: GRAPHQL_VARIABLES }),
+  });
+  const json = await res.json();
+  if (json.errors) throw new Error(json.errors[0].message);
+  return json.data.findManyUser_balances || [];
+}
 
 async function runBot() {
   if (!CONFIG.privateKey) {
@@ -259,22 +297,32 @@ async function runBot() {
   }
 
   const provider = new ethers.JsonRpcProvider(CONFIG.rpcUrl);
-  const signer = new ethers.Wallet(CONFIG.privateKey, provider);
-  const botAddress = await signer.getAddress();
+  const signer   = new ethers.Wallet(CONFIG.privateKey, provider);
+  const botAddr  = await signer.getAddress();
 
-  log("OK", `Bot iniciado`, {
-    address: botAddress,
-    rpc: CONFIG.rpcUrl,
-    minProfit: CONFIG.minProfitThreshold,
+  log("OK", "Bot iniciado", {
+    wallet:          botAddr,
+    rpc:             CONFIG.rpcUrl,
+    minProfitUSD:    `$${CONFIG.minProfitUSD}`,
     pollIntervalSeg: CONFIG.pollIntervalMs / 1000,
+    colateralPref:   COLLATERAL_OPTIONS.map((m) => m.name).join(" → "),
+    telegram:        CONFIG.telegramToken ? "configurado" : "no configurado",
   });
 
-  // Verificar balance de RBTC para gas
-  const rbtcBalance = await provider.getBalance(botAddress);
-  log("INFO", `Balance RBTC disponible: ${ethers.formatEther(rbtcBalance)} RBTC`);
-  if (rbtcBalance < ethers.parseEther("0.001")) {
+  const rbtcBal = await provider.getBalance(botAddr);
+  log("INFO", `Balance RBTC para gas: ${ethers.formatEther(rbtcBal)} RBTC`);
+
+  if (rbtcBal < ethers.parseEther("0.001")) {
     log("WARN", "Balance de RBTC bajo — puede no haber suficiente gas.");
+    await sendTelegram(`⚠️ <b>Balance RBTC bajo</b>\nEl bot tiene ${ethers.formatEther(rbtcBal)} RBTC — puede quedarse sin gas pronto.`);
   }
+
+  await sendTelegram(
+    `🤖 <b>Tropykus Bot iniciado</b>\n` +
+    `Wallet: <code>${botAddr}</code>\n` +
+    `Profit mínimo: $${CONFIG.minProfitUSD} USD\n` +
+    `Polling: cada ${CONFIG.pollIntervalMs / 1000}s`
+  );
 
   let cycle = 0;
 
@@ -282,43 +330,34 @@ async function runBot() {
     cycle++;
     log("INFO", `─── Ciclo #${cycle} ───`);
 
-    let opportunities = [];
+    let opportunities;
     try {
-      opportunities = await fetchLiquidationOpportunities();
-      log("INFO", `${opportunities.length} posición(es) en liquidación encontrada(s).`);
+      opportunities = await fetchOpportunities();
+      log("INFO", `${opportunities.length} posición(es) con is_in_liquidation = true.`);
     } catch (err) {
       log("ERROR", `Error consultando GraphQL: ${err.message}`);
       return;
     }
 
-    // Filtrar por profit mínimo
-    const eligible = opportunities.filter(
-      (o) => parseFloat(o.users?.liquidation_profit || 0) >= CONFIG.minProfitThreshold
-    );
+    const eligible = opportunities
+      .filter((o) => parseFloat(o.users?.liquidation_profit || 0) >= CONFIG.minProfitUSD)
+      .sort((a, b) => parseFloat(b.users.liquidation_profit) - parseFloat(a.users.liquidation_profit));
 
     if (eligible.length === 0) {
-      log("INFO", `Sin oportunidades con profit ≥ ${CONFIG.minProfitThreshold}`);
+      log("INFO", `Sin oportunidades con profit >= $${CONFIG.minProfitUSD} USD`);
       return;
     }
 
     log("OK", `${eligible.length} oportunidad(es) elegible(s):`);
-    eligible.forEach((o) => {
-      log("INFO", `  • ${o.users.address_lowercase} | ${o.markets.name} | profit: ${o.users.liquidation_profit}`);
-    });
-
-    // Ejecutar liquidaciones ordenadas por mayor profit primero
-    const sorted = [...eligible].sort(
-      (a, b) =>
-        parseFloat(b.users.liquidation_profit) -
-        parseFloat(a.users.liquidation_profit)
+    eligible.forEach((o) =>
+      log("INFO", `  * ${o.users.address_lowercase} | ${o.markets.name} | profit: $${o.users.liquidation_profit} USD`)
     );
 
-    for (const opp of sorted) {
+    for (const opp of eligible) {
       await executeLiquidation(opp, provider, signer);
     }
   }
 
-  // Ejecutar inmediatamente y luego en loop
   await poll();
   setInterval(poll, CONFIG.pollIntervalMs);
 }
