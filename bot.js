@@ -21,7 +21,7 @@ const CONFIG = {
   privateKey: process.env.PRIVATE_KEY, // NUNCA hardcodear — usar .env
   minProfitThreshold: parseFloat(process.env.MIN_PROFIT || "50"),
   pollIntervalMs: parseInt(process.env.POLL_INTERVAL_MS || "30000"), // 30 seg
-  graphqlUrl: "https://www.graphql1.tropykus.com/",
+  graphqlUrl: process.env.GRAPHQL_URL || "https://graphql1.tropykus.com/",
 };
 
 // ─── Contratos ────────────────────────────────────────────────────────────────
